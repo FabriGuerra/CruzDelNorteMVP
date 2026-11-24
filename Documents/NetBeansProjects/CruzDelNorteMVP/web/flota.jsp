@@ -1,6 +1,7 @@
 <%@page import="java.sql.ResultSet"%>
 <%@page import="java.sql.PreparedStatement"%>
 <%@page import="java.sql.Connection"%>
+<%@page import="java.math.BigDecimal"%>
 <%@page import="config.Conexion"%>
 <%@page import="modelo.Usuario"%>
 <%@page contentType="text/html" pageEncoding="UTF-8"%>
@@ -14,6 +15,98 @@
     Connection cn = null;
     PreparedStatement ps = null;
     ResultSet rs = null;
+
+    StringBuilder filasTabla = new StringBuilder();
+    StringBuilder puntosJs = new StringBuilder();
+    String errorSql = null;
+    double primeraLat = -9.074500;
+    double primeraLng = -78.593600;
+    boolean tienePunto = false;
+
+    try {
+        cn = Conexion.getConnection();
+        String sql = "SELECT b.placa, b.modelo, b.estado, g.latitud, g.longitud, g.velocidad_kmh, g.alerta, g.fecha_registro "
+                   + "FROM telemetria_gps g INNER JOIN buses b ON g.id_bus = b.id_bus "
+                   + "ORDER BY g.id_gps DESC LIMIT 15";
+        ps = cn.prepareStatement(sql);
+        rs = ps.executeQuery();
+
+        while (rs.next()) {
+            String placa = rs.getString("placa") != null ? rs.getString("placa") : "";
+            String modelo = rs.getString("modelo") != null ? rs.getString("modelo") : "";
+            String estado = rs.getString("estado") != null ? rs.getString("estado") : "";
+            BigDecimal latBd = rs.getBigDecimal("latitud");
+            BigDecimal lngBd = rs.getBigDecimal("longitud");
+            BigDecimal velBd = rs.getBigDecimal("velocidad_kmh");
+            String alerta = rs.getString("alerta") != null ? rs.getString("alerta") : "NORMAL";
+            String fechaStr = rs.getTimestamp("fecha_registro") != null ? rs.getTimestamp("fecha_registro").toString() : "";
+
+            boolean esAlerta = !"NORMAL".equalsIgnoreCase(alerta);
+
+            filasTabla.append("<tr>");
+            filasTabla.append("<td class=\"fw-bold\">").append(escapeHtml(placa)).append("</td>");
+            filasTabla.append("<td>").append(escapeHtml(modelo)).append("</td>");
+            filasTabla.append("<td><span class=\"badge bg-light text-dark border\">").append(escapeHtml(estado)).append("</span></td>");
+            filasTabla.append("<td>").append(latBd != null ? latBd.toPlainString() : "").append("</td>");
+            filasTabla.append("<td>").append(lngBd != null ? lngBd.toPlainString() : "").append("</td>");
+            filasTabla.append("<td>").append(velBd != null ? velBd.toPlainString() : "0").append(" km/h</td>");
+            filasTabla.append("<td><span class=\"badge ").append(esAlerta ? "bg-danger" : "bg-success").append("\">")
+                      .append(escapeHtml(alerta)).append("</span></td>");
+            filasTabla.append("<td class=\"small text-muted\">").append(escapeHtml(fechaStr)).append("</td>");
+            filasTabla.append("</tr>");
+
+            if (latBd != null && lngBd != null) {
+                double latVal = latBd.doubleValue();
+                double lngVal = lngBd.doubleValue();
+                if (latVal != 0.0 || lngVal != 0.0) {
+                    double velVal = velBd != null ? velBd.doubleValue() : 0.0;
+                    if (!tienePunto) {
+                        primeraLat = latVal;
+                        primeraLng = lngVal;
+                        tienePunto = true;
+                    }
+                    if (puntosJs.length() > 0) {
+                        puntosJs.append(",");
+                    }
+                    puntosJs.append("{")
+                            .append("placa:\"").append(escapeJs(placa)).append("\",")
+                            .append("modelo:\"").append(escapeJs(modelo)).append("\",")
+                            .append("estado:\"").append(escapeJs(estado)).append("\",")
+                            .append("lat:").append(latVal).append(",")
+                            .append("lng:").append(lngVal).append(",")
+                            .append("velocidad:").append(velVal).append(",")
+                            .append("alerta:\"").append(escapeJs(alerta)).append("\",")
+                            .append("fecha:\"").append(escapeJs(fechaStr)).append("\"")
+                            .append("}");
+                }
+            }
+        }
+    } catch (Exception e) {
+        errorSql = e.getMessage();
+    } finally {
+        try { if (rs != null) rs.close(); } catch (Exception ex) {}
+        try { if (ps != null) ps.close(); } catch (Exception ex) {}
+        try { if (cn != null) cn.close(); } catch (Exception ex) {}
+    }
+%>
+<%!
+    private String escapeHtml(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;")
+                .replace("'", "&#39;");
+    }
+
+    private String escapeJs(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("'", "\\'")
+                .replace("\n", " ")
+                .replace("\r", " ");
+    }
 %>
 <!DOCTYPE html>
 <html>
@@ -22,6 +115,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Flota y GPS Simulado - Cruz del Norte S.A.C.</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        #mapaFlota {
+            height: 420px;
+            width: 100%;
+            border-radius: 0.5rem;
+            z-index: 1;
+        }
+    </style>
 </head>
 <body class="bg-light">
 <nav class="navbar navbar-dark shadow-sm mb-4" style="background-color: #0b3967;">
@@ -70,6 +172,22 @@
         </div>
     </div>
 
+    <div class="card border-0 shadow-sm mb-4">
+        <div class="card-header bg-white d-flex flex-wrap justify-content-between align-items-center gap-2 py-3">
+            <div>
+                <span class="fw-bold">Mapa en Tiempo Simulado (OpenStreetMap)</span>
+                <span class="badge bg-success ms-2">Normal</span>
+                <span class="badge bg-danger ms-1">Alerta (&gt; 90 km/h o estado crítico)</span>
+            </div>
+            <button type="button" id="btnCentrarUltimo" class="btn btn-sm btn-outline-primary">
+                Centrar en último registro
+            </button>
+        </div>
+        <div class="card-body">
+            <div id="mapaFlota"></div>
+        </div>
+    </div>
+
     <div class="card border-0 shadow-sm">
         <div class="card-body">
             <div class="table-responsive">
@@ -88,40 +206,12 @@
                     </thead>
                     <tbody>
                     <%
-                        try {
-                            cn = Conexion.getConnection();
-                            String sql = "SELECT b.placa, b.modelo, b.estado, g.latitud, g.longitud, g.velocidad_kmh, g.alerta, g.fecha_registro "
-                                       + "FROM telemetria_gps g INNER JOIN buses b ON g.id_bus = b.id_bus "
-                                       + "ORDER BY g.id_gps DESC LIMIT 15";
-                            ps = cn.prepareStatement(sql);
-                            rs = ps.executeQuery();
-
-                            while (rs.next()) {
-                                String alerta = rs.getString("alerta");
-                                boolean esAlerta = !"NORMAL".equals(alerta);
+                        if (errorSql != null) {
                     %>
-                        <tr>
-                            <td class="fw-bold"><%= rs.getString("placa") %></td>
-                            <td><%= rs.getString("modelo") %></td>
-                            <td><span class="badge bg-light text-dark border"><%= rs.getString("estado") %></span></td>
-                            <td><%= rs.getBigDecimal("latitud") %></td>
-                            <td><%= rs.getBigDecimal("longitud") %></td>
-                            <td><%= rs.getBigDecimal("velocidad_kmh") %> km/h</td>
-                            <td>
-                                <span class="badge <%= esAlerta ? "bg-danger" : "bg-success" %>"><%= alerta %></span>
-                            </td>
-                            <td class="small text-muted"><%= rs.getTimestamp("fecha_registro") %></td>
-                        </tr>
+                        <tr><td colspan="8" class="text-danger">Error al cargar GPS: <%= escapeHtml(errorSql) %></td></tr>
                     <%
-                            }
-                        } catch (Exception e) {
-                    %>
-                        <tr><td colspan="8" class="text-danger">Error al cargar GPS: <%= e.getMessage() %></td></tr>
-                    <%
-                        } finally {
-                            try { if (rs != null) rs.close(); } catch (Exception ex) {}
-                            try { if (ps != null) ps.close(); } catch (Exception ex) {}
-                            try { if (cn != null) cn.close(); } catch (Exception ex) {}
+                        } else {
+                            out.print(filasTabla.toString());
                         }
                     %>
                     </tbody>
@@ -130,5 +220,62 @@
         </div>
     </div>
 </div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+    (function () {
+        const puntos = [<%= puntosJs.toString() %>];
+        const coordPorDefecto = [<%= primeraLat %>, <%= primeraLng %>];
+        const map = L.map("mapaFlota").setView(coordPorDefecto, 11);
+
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            maxZoom: 19,
+            attribution: "&copy; OpenStreetMap contributors"
+        }).addTo(map);
+
+        const bounds = [];
+
+        puntos.forEach((p, idx) => {
+            const esAlerta = (p.alerta && p.alerta.toUpperCase() !== "NORMAL") || p.velocidad > 90;
+            const colorMarcador = esAlerta ? "#dc3545" : "#198754";
+
+            const marker = L.circleMarker([p.lat, p.lng], {
+                radius: idx === 0 ? 11 : 8,
+                fillColor: colorMarcador,
+                color: "#ffffff",
+                weight: 2,
+                opacity: 1,
+                fillOpacity: 0.9
+            }).addTo(map);
+
+            const badgeClass = esAlerta ? "bg-danger" : "bg-success";
+            marker.bindPopup(
+                "<div style='min-width:180px'>" +
+                "<strong>" + p.placa + "</strong> <span class='text-muted'>(" + p.modelo + ")</span><br>" +
+                "<span class='badge " + badgeClass + " my-1'>" + p.alerta + " · " + p.velocidad + " km/h</span><br>" +
+                "<small>Estado: " + p.estado + "</small><br>" +
+                "<small class='text-muted'>Coord: " + p.lat.toFixed(6) + ", " + p.lng.toFixed(6) + "</small><br>" +
+                "<small class='text-muted'>" + p.fecha + "</small>" +
+                "</div>"
+            );
+
+            bounds.push([p.lat, p.lng]);
+            if (idx === 0) {
+                marker.openPopup();
+            }
+        });
+
+        if (bounds.length > 1) {
+            map.fitBounds(bounds, { padding: [35, 35] });
+        }
+
+        const btnCentrar = document.getElementById("btnCentrarUltimo");
+        if (btnCentrar) {
+            btnCentrar.addEventListener("click", function () {
+                map.setView(coordPorDefecto, 13);
+            });
+        }
+    })();
+</script>
 </body>
 </html>
